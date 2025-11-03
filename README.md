@@ -31,7 +31,13 @@ curl http://vm3:8080/cpu-perf  # 120000 ops/sec  ← throttled!
 curl http://vm4:8080/cpu-perf  # 241000 ops/sec
 ```
 
-Monitor multiple VMs:
+**Deploy to multiple VMs:**
+```bash
+# On each VM, run:
+curl -L https://files.tensorturtle.com/yundera-cpu-stress/cpu-stress-linux-amd64 -o cpu-stress && chmod +x cpu-stress && ./cpu-stress
+```
+
+**Monitor multiple VMs:**
 ```bash
 while true; do
   for vm in 192.168.1.{101..104}; do
@@ -52,15 +58,9 @@ done
 
 ## Installation
 
-**Download pre-built Linux binary:**
-1. Go to [GitHub Actions](https://github.com/tensorturtle/distributed-cpu-stress-reporter/actions)
-2. Click the latest "Build Linux Binary" workflow
-3. Download `cpu-stress-linux-amd64` from artifacts
-4. Extract and run:
+**Download and run (Linux AMD64):**
 ```bash
-unzip cpu-stress-linux-amd64.zip
-chmod +x cpu-stress-linux-amd64
-./cpu-stress-linux-amd64
+curl -L https://files.tensorturtle.com/yundera-cpu-stress/cpu-stress-linux-amd64 -o cpu-stress && chmod +x cpu-stress && ./cpu-stress
 ```
 
 **Install from crates.io:**
