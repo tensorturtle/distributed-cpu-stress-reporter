@@ -1,6 +1,6 @@
 [package]
 name = "distributed-cpu-stress-reporter"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "HTTP server that stress-tests CPU cores and reports performance metrics for measuring CPU performance in virtualized environments"
 license = "MIT OR Apache-2.0"
