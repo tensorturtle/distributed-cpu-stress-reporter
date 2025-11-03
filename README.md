@@ -52,10 +52,20 @@ done
 
 ## Installation
 
+**Download pre-built Linux binary:**
+1. Go to [GitHub Actions](https://github.com/tensorturtle/distributed-cpu-stress-reporter/actions)
+2. Click the latest "Build Linux Binary" workflow
+3. Download `cpu-stress-linux-amd64` from artifacts
+4. Extract and run:
+```bash
+unzip cpu-stress-linux-amd64.zip
+chmod +x cpu-stress-linux-amd64
+./cpu-stress-linux-amd64
+```
+
 **Install from crates.io:**
 ```bash
 cargo install distributed-cpu-stress-reporter
-distributed-cpu-stress-reporter
 ```
 
 **Build from source:**
@@ -64,11 +74,6 @@ git clone https://github.com/tensorturtle/distributed-cpu-stress-reporter.git
 cd distributed-cpu-stress-reporter
 cargo build --release
 ./target/release/distributed-cpu-stress-reporter
-```
-
-**Deploy to VMs:**
-```bash
-scp target/release/distributed-cpu-stress-reporter user@vm:/usr/local/bin/
 ```
 
 ## FAQ
