@@ -1,5 +1,5 @@
-use axum::{routing::get, Router};
-use std::sync::atomic::{AtomicU64, Ordering};
+use axum::{routing::{get, post}, Router};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -8,6 +8,7 @@ use std::time::Duration;
 struct AppState {
     operations_per_second: AtomicU64,
     current_counter: Arc<AtomicU64>,
+    is_running: AtomicBool,
 }
 
 // Simple prime number check using trial division
@@ -18,12 +19,12 @@ fn is_prime(n: u64) -> bool {
     if n == 2 {
         return true;
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         return false;
     }
     let limit = (n as f64).sqrt() as u64;
     for i in (3..=limit).step_by(2) {
-        if n % i == 0 {
+        if n.is_multiple_of(i) {
             return false;
         }
     }
@@ -31,15 +32,21 @@ fn is_prime(n: u64) -> bool {
 }
 
 // CPU-bound worker that continuously calculates primes
-fn cpu_worker(counter: Arc<AtomicU64>) {
+fn cpu_worker(state: Arc<AppState>) {
     let mut n = 2u64;
     loop {
-        if is_prime(n) {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-        n = n.wrapping_add(1);
-        if n < 2 {
-            n = 2; // Reset on overflow
+        // Check if we should be running
+        if state.is_running.load(Ordering::Relaxed) {
+            if is_prime(n) {
+                state.current_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            n = n.wrapping_add(1);
+            if n < 2 {
+                n = 2; // Reset on overflow
+            }
+        } else {
+            // When not running, sleep briefly to avoid busy-waiting
+            thread::sleep(Duration::from_millis(100));
         }
     }
 }
@@ -65,28 +72,63 @@ async fn cpu_perf_handler(
     format!("{}\n", ops)
 }
 
+// HTTP handler for POST /start-cpu endpoint
+async fn start_cpu_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> String {
+    // Only start if not already running (ignore if already running)
+    if !state.is_running.load(Ordering::Relaxed) {
+        state.is_running.store(true, Ordering::Relaxed);
+        println!("CPU stress test STARTED");
+        "CPU stress test started\n".to_string()
+    } else {
+        "CPU stress test already running\n".to_string()
+    }
+}
+
+// HTTP handler for POST /end-cpu endpoint
+async fn end_cpu_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> String {
+    // Idempotent stop - always returns success
+    state.is_running.store(false, Ordering::Relaxed);
+    // Reset the counter and operations per second when stopping
+    state.current_counter.store(0, Ordering::Relaxed);
+    state.operations_per_second.store(0, Ordering::Relaxed);
+    println!("CPU stress test STOPPED");
+    "CPU stress test stopped\n".to_string()
+}
+
 #[tokio::main]
 async fn main() {
     let num_cores = num_cpus::get();
 
     println!("Distributed CPU Stress Reporter");
-    println!("Starting CPU stress on {} cores", num_cores);
+    println!("Worker threads ready on {} cores", num_cores);
     println!("HTTP server listening on 0.0.0.0:8080");
-    println!("Query endpoint: http://localhost:8080/cpu-perf");
+    println!();
+    println!("Control endpoints:");
+    println!("  POST http://localhost:8080/start-cpu - Start CPU stress test");
+    println!("  POST http://localhost:8080/end-cpu   - Stop CPU stress test");
+    println!("Query endpoint:");
+    println!("  GET  http://localhost:8080/cpu-perf  - Get operations per second");
+    println!();
+    println!("CPU stress test is currently STOPPED. Send POST to /start-cpu to begin.");
     println!();
 
-    // Create shared state
+    // Create shared state with CPU stress initially stopped
     let state = Arc::new(AppState {
         operations_per_second: AtomicU64::new(0),
         current_counter: Arc::new(AtomicU64::new(0)),
+        is_running: AtomicBool::new(false),
     });
 
     // Spawn worker threads for each CPU core
     for i in 0..num_cores {
-        let counter = Arc::clone(&state.current_counter);
+        let state_clone = Arc::clone(&state);
         thread::spawn(move || {
-            println!("Worker thread {} started", i);
-            cpu_worker(counter);
+            println!("Worker thread {} ready", i);
+            cpu_worker(state_clone);
         });
     }
 
@@ -104,6 +146,8 @@ async fn main() {
     // Build HTTP router
     let app = Router::new()
         .route("/cpu-perf", get(cpu_perf_handler))
+        .route("/start-cpu", post(start_cpu_handler))
+        .route("/end-cpu", post(end_cpu_handler))
         .with_state(state);
 
     // Start HTTP server

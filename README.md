@@ -11,10 +11,17 @@ cargo build --release
 ./target/release/distributed-cpu-stress-reporter
 ```
 
-Query performance:
+Start CPU stress test and query performance:
 ```bash
+# Start the CPU stress test
+curl -X POST http://localhost:8080/start-cpu
+
+# Query performance
 curl http://localhost:8080/cpu-perf
 # Returns: 254060 (operations/second)
+
+# Stop the CPU stress test
+curl -X POST http://localhost:8080/end-cpu
 ```
 
 ## Use Case
@@ -24,6 +31,9 @@ Test CPU overprovisioning in VMs. Run this in multiple VMs on the same hyperviso
 **Example:** Proxmox host with 8 cores running 4 VMs with 4 vCPUs each (2x overprovisioned):
 
 ```bash
+# Start CPU stress test on all VMs
+for vm in vm1 vm2 vm3 vm4; do curl -X POST http://$vm:8080/start-cpu; done
+
 # Query each VM
 curl http://vm1:8080/cpu-perf  # 240000 ops/sec
 curl http://vm2:8080/cpu-perf  # 238000 ops/sec
@@ -39,6 +49,12 @@ curl -L https://files.tensorturtle.com/yundera-cpu-stress/cpu-stress-linux-amd64
 
 **Monitor multiple VMs:**
 ```bash
+# Start CPU stress on all VMs
+for vm in 192.168.1.{101..104}; do
+  curl -s -X POST http://$vm:8080/start-cpu
+done
+
+# Monitor performance
 while true; do
   for vm in 192.168.1.{101..104}; do
     echo "$vm: $(curl -s http://$vm:8080/cpu-perf) ops/sec"
@@ -50,9 +66,13 @@ done
 ## How It Works
 
 - Spawns one worker thread per CPU core
-- Each thread continuously calculates prime numbers
+- CPU stress test starts in STOPPED state (use `/start-cpu` to begin)
+- Each thread continuously calculates prime numbers when running
 - Atomic counter tracks operations per second (1-second intervals)
-- HTTP server (Axum) serves latest metric at `/cpu-perf`
+- HTTP server (Axum) provides control and query endpoints:
+  - POST `/start-cpu` - Start CPU stress test
+  - POST `/end-cpu` - Stop CPU stress test
+  - GET `/cpu-perf` - Get current operations per second
 
 **Why prime numbers?** Pure CPU computation with no I/O - perfect for measuring CPU performance.
 
@@ -82,7 +102,7 @@ cargo build --release
 A: No. Standard CPU stress test like Prime95.
 
 **Q: How do I stop it?**
-A: `Ctrl+C`
+A: `curl -X POST http://localhost:8080/end-cpu` or `Ctrl+C` to exit the application
 
 **Q: Can I change the port?**
 A: Edit `src/main.rs:110` and rebuild.
