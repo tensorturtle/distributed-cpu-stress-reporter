@@ -105,7 +105,7 @@ async fn main() {
 
     println!("Distributed CPU Stress Reporter");
     println!("Worker threads ready on {} cores", num_cores);
-    println!("HTTP server listening on 0.0.0.0:8080");
+    println!("HTTP server listening on [::]:8080 (IPv4 and IPv6)");
     println!();
     println!("Control endpoints:");
     println!("  POST http://localhost:8080/start-cpu - Start CPU stress test");
@@ -151,7 +151,7 @@ async fn main() {
         .with_state(state);
 
     // Start HTTP server
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
+    let listener = tokio::net::TcpListener::bind("[::]:8080")
         .await
         .expect("Failed to bind to port 8080");
 
