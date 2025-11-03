@@ -190,11 +190,12 @@ checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
 name = "distributed-cpu-stress-reporter"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "axum",
  "clap",
  "num_cpus",
+ "serde",
  "tokio",
 ]
 
@@ -518,6 +519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

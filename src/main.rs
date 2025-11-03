@@ -1,19 +1,28 @@
 use axum::{routing::{get, post}, Router};
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ExecutionMode {
+    Threaded,
+    FreshProcess,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartCpuRequest {
+    mode: ExecutionMode,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "distributed-cpu-stress-reporter")]
 #[command(about = "CPU stress testing and performance reporting", long_about = None)]
 struct Args {
-    /// Use fresh-process mode to avoid scheduler catch-up bias
-    #[arg(long)]
-    fresh_process_mode: bool,
-
     /// Internal: Run as worker process (do not use directly)
     #[arg(long, hide = true)]
     worker: bool,
@@ -28,6 +37,7 @@ struct AppState {
     operations_per_second: AtomicU64,
     current_counter: Arc<AtomicU64>,
     is_running: AtomicBool,
+    execution_mode: Mutex<ExecutionMode>,
 }
 
 // Simple prime number check using trial division
@@ -54,8 +64,11 @@ fn is_prime(n: u64) -> bool {
 fn cpu_worker(state: Arc<AppState>) {
     let mut n = 2u64;
     loop {
-        // Check if we should be running
-        if state.is_running.load(Ordering::Relaxed) {
+        // Check if we should be running AND in threaded mode
+        let is_active = state.is_running.load(Ordering::Relaxed)
+            && *state.execution_mode.lock().unwrap() == ExecutionMode::Threaded;
+
+        if is_active {
             if is_prime(n) {
                 state.current_counter.fetch_add(1, Ordering::Relaxed);
             }
@@ -64,7 +77,7 @@ fn cpu_worker(state: Arc<AppState>) {
                 n = 2; // Reset on overflow
             }
         } else {
-            // When not running, sleep briefly to avoid busy-waiting
+            // When not running or not in correct mode, sleep briefly to avoid busy-waiting
             thread::sleep(Duration::from_millis(100));
         }
     }
@@ -107,8 +120,11 @@ fn process_spawner(state: Arc<AppState>, core_id: usize, worker_ops: u64) {
     let exe_path = std::env::current_exe().expect("Failed to get current executable path");
 
     loop {
-        // Check if we should be running
-        if !state.is_running.load(Ordering::Relaxed) {
+        // Check if we should be running AND in fresh-process mode
+        let is_active = state.is_running.load(Ordering::Relaxed)
+            && *state.execution_mode.lock().unwrap() == ExecutionMode::FreshProcess;
+
+        if !is_active {
             thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -154,14 +170,44 @@ async fn cpu_perf_handler(
 // HTTP handler for POST /start-cpu endpoint
 async fn start_cpu_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::Json(request): axum::Json<StartCpuRequest>,
 ) -> String {
-    // Only start if not already running (ignore if already running)
-    if !state.is_running.load(Ordering::Relaxed) {
+    let current_mode = *state.execution_mode.lock().unwrap();
+    let requested_mode = request.mode;
+    let is_running = state.is_running.load(Ordering::Relaxed);
+
+    // If already running with a different mode, we need to restart
+    if is_running && current_mode != requested_mode {
+        println!("Mode change requested while running. Stopping, changing mode, and restarting...");
+
+        // Stop current workers
+        state.is_running.store(false, Ordering::Relaxed);
+
+        // Reset counters
+        state.current_counter.store(0, Ordering::Relaxed);
+        state.operations_per_second.store(0, Ordering::Relaxed);
+
+        // Wait a moment for workers to notice the stop
+        thread::sleep(Duration::from_millis(200));
+
+        // Change mode
+        *state.execution_mode.lock().unwrap() = requested_mode;
+
+        // Start with new mode
         state.is_running.store(true, Ordering::Relaxed);
-        println!("CPU stress test STARTED");
-        "CPU stress test started\n".to_string()
+
+        println!("CPU stress test RESTARTED with mode: {:?}", requested_mode);
+        format!("CPU stress test restarted with mode: {:?}\n", requested_mode)
+    } else if is_running && current_mode == requested_mode {
+        // Already running with the requested mode
+        format!("CPU stress test already running with mode: {:?}\n", current_mode)
     } else {
-        "CPU stress test already running\n".to_string()
+        // Not running, so set mode and start
+        *state.execution_mode.lock().unwrap() = requested_mode;
+        state.is_running.store(true, Ordering::Relaxed);
+
+        println!("CPU stress test STARTED with mode: {:?}", requested_mode);
+        format!("CPU stress test started with mode: {:?}\n", requested_mode)
     }
 }
 
@@ -191,51 +237,46 @@ async fn main() {
     let num_cores = num_cpus::get();
 
     println!("Distributed CPU Stress Reporter");
-    if args.fresh_process_mode {
-        println!("Mode: Fresh-Process (avoids scheduler catch-up bias)");
-        println!("Worker processes: {} (one per core)", num_cores);
-    } else {
-        println!("Mode: Default (threaded)");
-        println!("Worker threads: {} (one per core)", num_cores);
-    }
+    println!("Worker threads/processes: {} (one per core)", num_cores);
     println!("HTTP server listening on [::]:8080 (IPv4 and IPv6)");
     println!();
     println!("Control endpoints:");
-    println!("  POST http://localhost:8080/start-cpu - Start CPU stress test");
+    println!("  POST http://localhost:8080/start-cpu - Start CPU stress test (requires JSON body with mode)");
+    println!("       Example: curl -X POST http://localhost:8080/start-cpu -H 'Content-Type: application/json' -d '{{\"mode\":\"threaded\"}}'");
+    println!("       Modes: \"threaded\" or \"fresh-process\"");
     println!("  POST http://localhost:8080/end-cpu   - Stop CPU stress test");
     println!("Query endpoint:");
     println!("  GET  http://localhost:8080/cpu-perf  - Get operations per second");
     println!();
-    println!("CPU stress test is currently STOPPED. Send POST to /start-cpu to begin.");
+    println!("CPU stress test is currently STOPPED. Send POST to /start-cpu with mode to begin.");
     println!();
 
-    // Create shared state with CPU stress initially stopped
+    // Create shared state with CPU stress initially stopped, default to fresh-process mode
     let state = Arc::new(AppState {
         operations_per_second: AtomicU64::new(0),
         current_counter: Arc::new(AtomicU64::new(0)),
         is_running: AtomicBool::new(false),
+        execution_mode: Mutex::new(ExecutionMode::FreshProcess),
     });
 
-    // Spawn workers based on mode
-    if args.fresh_process_mode {
-        // Fresh-process mode: spawn process spawners
-        for i in 0..num_cores {
-            let state_clone = Arc::clone(&state);
-            let worker_ops = args.worker_ops;
-            thread::spawn(move || {
-                println!("Process spawner {} ready", i);
-                process_spawner(state_clone, i, worker_ops);
-            });
-        }
-    } else {
-        // Default mode: spawn worker threads
-        for i in 0..num_cores {
-            let state_clone = Arc::clone(&state);
-            thread::spawn(move || {
-                println!("Worker thread {} ready", i);
-                cpu_worker(state_clone);
-            });
-        }
+    // Spawn BOTH types of workers - they'll activate based on the execution_mode
+    // Threaded workers
+    for i in 0..num_cores {
+        let state_clone = Arc::clone(&state);
+        thread::spawn(move || {
+            println!("Threaded worker {} ready (inactive until mode=threaded)", i);
+            cpu_worker(state_clone);
+        });
+    }
+
+    // Fresh-process spawners
+    for i in 0..num_cores {
+        let state_clone = Arc::clone(&state);
+        let worker_ops = args.worker_ops;
+        thread::spawn(move || {
+            println!("Fresh-process spawner {} ready (inactive until mode=fresh-process)", i);
+            process_spawner(state_clone, i, worker_ops);
+        });
     }
 
     // Spawn sampling thread

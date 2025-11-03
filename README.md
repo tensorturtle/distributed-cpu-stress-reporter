@@ -13,8 +13,10 @@ cargo build --release
 
 Start CPU stress test and query performance:
 ```bash
-# Start the CPU stress test
-curl -X POST http://localhost:8080/start-cpu
+# Start the CPU stress test (requires mode specification)
+curl -X POST http://localhost:8080/start-cpu \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"fresh-process"}'
 
 # Query performance
 curl http://localhost:8080/cpu-perf
@@ -32,7 +34,11 @@ Test CPU overprovisioning in VMs. Run this in multiple VMs on the same hyperviso
 
 ```bash
 # Start CPU stress test on all VMs
-for vm in vm1 vm2 vm3 vm4; do curl -X POST http://$vm:8080/start-cpu; done
+for vm in vm1 vm2 vm3 vm4; do
+  curl -X POST http://$vm:8080/start-cpu \
+    -H 'Content-Type: application/json' \
+    -d '{"mode":"fresh-process"}'
+done
 
 # Query each VM
 curl http://vm1:8080/cpu-perf  # 240000 ops/sec
@@ -51,7 +57,9 @@ curl -L https://files.tensorturtle.com/yundera-cpu-stress/cpu-stress-linux-amd64
 ```bash
 # Start CPU stress on all VMs
 for vm in 192.168.1.{101..104}; do
-  curl -s -X POST http://$vm:8080/start-cpu
+  curl -s -X POST http://$vm:8080/start-cpu \
+    -H 'Content-Type: application/json' \
+    -d '{"mode":"fresh-process"}'
 done
 
 # Monitor performance
@@ -65,12 +73,14 @@ done
 
 ## How It Works
 
-- Spawns one worker thread per CPU core
+- Spawns both threaded and fresh-process workers (one per CPU core)
 - CPU stress test starts in STOPPED state (use `/start-cpu` to begin)
-- Each thread continuously calculates prime numbers when running
+- Mode selection determines which worker type is active:
+  - **Threaded mode**: Long-running threads continuously calculate primes (max performance)
+  - **Fresh-process mode**: Spawns short-lived child processes for each calculation cycle (avoids scheduler bias)
 - Atomic counter tracks operations per second (1-second intervals)
 - HTTP server (Axum) provides control and query endpoints:
-  - POST `/start-cpu` - Start CPU stress test
+  - POST `/start-cpu` - Start CPU stress test (requires JSON body with mode)
   - POST `/end-cpu` - Stop CPU stress test
   - GET `/cpu-perf` - Get current operations per second
 
@@ -94,14 +104,18 @@ When measuring CPU overprovisioning effects, catch-up bias can skew results. If 
 
 1. **Launch all instances simultaneously** - Start all test instances at the same time to ensure fair comparison
 2. **Wait for equilibrium** - Let instances run for several minutes until scheduler balancing stabilizes
-3. **Use fresh-process mode** - Run with `--fresh-process-mode` flag (see below)
+3. **Use fresh-process mode** (recommended, see below)
 
-### Fresh Process Mode
+### Execution Modes
 
-To avoid catch-up bias entirely, use `--fresh-process-mode`:
+The application supports two execution modes, controlled via the HTTP API:
+
+#### Fresh Process Mode (Default & Recommended)
 
 ```bash
-./target/release/distributed-cpu-stress-reporter --fresh-process-mode
+curl -X POST http://localhost:8080/start-cpu \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"fresh-process"}'
 ```
 
 In this mode:
@@ -110,17 +124,39 @@ In this mode:
 - No long-running processes accumulate virtual runtime
 - All instances get equal scheduler treatment regardless of start time
 
-**Trade-off:** Fresh-process mode has higher overhead from process creation/destruction, resulting in slightly lower absolute performance. However, it provides fairer comparison when multiple instances compete for CPU.
-
-**When to use fresh-process mode:**
+**When to use:**
 - Testing multiple instances launched at different times
-- Measuring steady-state CPU contention without scheduler bias
+- Measuring steady-state CPU contention without scheduler bias (recommended)
 - Comparing performance across instances that need equal scheduler treatment
 
-**When to use default (threaded) mode:**
+#### Threaded Mode
+
+```bash
+curl -X POST http://localhost:8080/start-cpu \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"threaded"}'
+```
+
+In this mode:
+- Long-running worker threads continuously calculate primes
+- Maximum CPU stress and absolute performance
+- Subject to scheduler catch-up bias when multiple instances compete
+
+**When to use:**
 - Maximum CPU stress and performance
 - Single instance testing
 - All instances launched simultaneously
+
+#### Switching Modes
+
+You can switch modes at any time via the API. If the CPU stress test is running, it will automatically restart with the new mode:
+
+```bash
+# Switch from fresh-process to threaded
+curl -X POST http://localhost:8080/start-cpu \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"threaded"}'
+```
 
 ## Installation
 
@@ -149,6 +185,9 @@ A: No. Standard CPU stress test like Prime95.
 
 **Q: How do I stop it?**
 A: `curl -X POST http://localhost:8080/end-cpu` or `Ctrl+C` to exit the application
+
+**Q: Which mode should I use?**
+A: Use fresh-process mode (the default) for most testing scenarios, especially when comparing multiple instances. Use threaded mode only when you need maximum performance or are testing a single instance.
 
 **Q: Can I change the port?**
 A: Edit `src/main.rs:110` and rebuild.
