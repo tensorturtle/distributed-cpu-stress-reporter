@@ -52,8 +52,16 @@ done
 
 ## Installation
 
+**Install from crates.io:**
+```bash
+cargo install distributed-cpu-stress-reporter
+distributed-cpu-stress-reporter
+```
+
 **Build from source:**
 ```bash
+git clone https://github.com/tensorturtle/distributed-cpu-stress-reporter.git
+cd distributed-cpu-stress-reporter
 cargo build --release
 ./target/release/distributed-cpu-stress-reporter
 ```
@@ -107,4 +115,9 @@ echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governo
 
 ## License
 
-Open source for testing and monitoring use.
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
