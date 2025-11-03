@@ -19,7 +19,7 @@ struct Args {
     worker: bool,
 
     /// Internal: Number of operations for worker to perform
-    #[arg(long, hide = true, default_value = "100000")]
+    #[arg(long, hide = true, default_value = "20000")]
     worker_ops: u64,
 }
 
