@@ -76,6 +76,52 @@ done
 
 **Why prime numbers?** Pure CPU computation with no I/O - perfect for measuring CPU performance.
 
+## Scheduler Catch-Up Bias
+
+When running multiple instances of this program competing for limited CPU cores, you may observe that **newly launched instances receive more CPU allocation** than older running instances. This is a Linux scheduler behavior called "catch-up bias."
+
+**What happens:**
+- The Linux CFS (Completely Fair Scheduler) tracks CPU time consumed by each process (virtual runtime)
+- Older processes have accumulated more virtual runtime
+- Newly launched processes start with low virtual runtime
+- The scheduler prioritizes processes that are "behind" to achieve fairness
+- Result: New instances temporarily get more CPU to "catch up"
+
+**Why this matters for testing:**
+When measuring CPU overprovisioning effects, catch-up bias can skew results. If you launch instances at different times, newer instances will appear to perform better, making it difficult to measure true steady-state CPU contention.
+
+**Solutions:**
+
+1. **Launch all instances simultaneously** - Start all test instances at the same time to ensure fair comparison
+2. **Wait for equilibrium** - Let instances run for several minutes until scheduler balancing stabilizes
+3. **Use fresh-process mode** - Run with `--fresh-process-mode` flag (see below)
+
+### Fresh Process Mode
+
+To avoid catch-up bias entirely, use `--fresh-process-mode`:
+
+```bash
+./target/release/distributed-cpu-stress-reporter --fresh-process-mode
+```
+
+In this mode:
+- Main HTTP server runs continuously
+- Each CPU calculation runs in a fresh child process that exits after completing work
+- No long-running processes accumulate virtual runtime
+- All instances get equal scheduler treatment regardless of start time
+
+**Trade-off:** Fresh-process mode has higher overhead from process creation/destruction, resulting in slightly lower absolute performance. However, it provides fairer comparison when multiple instances compete for CPU.
+
+**When to use fresh-process mode:**
+- Testing multiple instances launched at different times
+- Measuring steady-state CPU contention without scheduler bias
+- Comparing performance across instances that need equal scheduler treatment
+
+**When to use default (threaded) mode:**
+- Maximum CPU stress and performance
+- Single instance testing
+- All instances launched simultaneously
+
 ## Installation
 
 **Download and run (Linux AMD64):**

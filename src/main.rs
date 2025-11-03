@@ -1,8 +1,27 @@
 use axum::{routing::{get, post}, Router};
+use clap::Parser;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+#[derive(Parser, Debug)]
+#[command(name = "distributed-cpu-stress-reporter")]
+#[command(about = "CPU stress testing and performance reporting", long_about = None)]
+struct Args {
+    /// Use fresh-process mode to avoid scheduler catch-up bias
+    #[arg(long)]
+    fresh_process_mode: bool,
+
+    /// Internal: Run as worker process (do not use directly)
+    #[arg(long, hide = true)]
+    worker: bool,
+
+    /// Internal: Number of operations for worker to perform
+    #[arg(long, hide = true, default_value = "100000")]
+    worker_ops: u64,
+}
 
 // Shared state for performance metrics
 struct AppState {
@@ -64,6 +83,66 @@ fn sampler(state: Arc<AppState>) {
     }
 }
 
+// Worker mode: Run a fixed amount of work and exit
+fn run_worker(num_ops: u64) {
+    let mut count = 0u64;
+    let mut n = 2u64;
+
+    while count < num_ops {
+        if is_prime(n) {
+            count += 1;
+        }
+        n = n.wrapping_add(1);
+        if n < 2 {
+            n = 2; // Reset on overflow
+        }
+    }
+
+    // Print the number of operations performed
+    println!("{}", count);
+}
+
+// Fresh-process mode: Spawn child processes continuously
+fn process_spawner(state: Arc<AppState>, core_id: usize, worker_ops: u64) {
+    let exe_path = std::env::current_exe().expect("Failed to get current executable path");
+
+    loop {
+        // Check if we should be running
+        if !state.is_running.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        // Spawn child process
+        let output = Command::new(&exe_path)
+            .arg("--worker")
+            .arg("--worker-ops")
+            .arg(worker_ops.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+
+        match output {
+            Ok(output) => {
+                if output.status.success() {
+                    // Parse the operation count from stdout
+                    if let Ok(stdout) = String::from_utf8(output.stdout) {
+                        if let Ok(ops) = stdout.trim().parse::<u64>() {
+                            state.current_counter.fetch_add(ops, Ordering::Relaxed);
+                        }
+                    }
+                } else {
+                    eprintln!("Worker process {} failed with status: {}", core_id, output.status);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to spawn worker process {}: {}", core_id, e);
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
 // HTTP handler for /cpu-perf endpoint
 async fn cpu_perf_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -101,10 +180,24 @@ async fn end_cpu_handler(
 
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+
+    // If running in worker mode, do the work and exit
+    if args.worker {
+        run_worker(args.worker_ops);
+        return;
+    }
+
     let num_cores = num_cpus::get();
 
     println!("Distributed CPU Stress Reporter");
-    println!("Worker threads ready on {} cores", num_cores);
+    if args.fresh_process_mode {
+        println!("Mode: Fresh-Process (avoids scheduler catch-up bias)");
+        println!("Worker processes: {} (one per core)", num_cores);
+    } else {
+        println!("Mode: Default (threaded)");
+        println!("Worker threads: {} (one per core)", num_cores);
+    }
     println!("HTTP server listening on [::]:8080 (IPv4 and IPv6)");
     println!();
     println!("Control endpoints:");
@@ -123,13 +216,26 @@ async fn main() {
         is_running: AtomicBool::new(false),
     });
 
-    // Spawn worker threads for each CPU core
-    for i in 0..num_cores {
-        let state_clone = Arc::clone(&state);
-        thread::spawn(move || {
-            println!("Worker thread {} ready", i);
-            cpu_worker(state_clone);
-        });
+    // Spawn workers based on mode
+    if args.fresh_process_mode {
+        // Fresh-process mode: spawn process spawners
+        for i in 0..num_cores {
+            let state_clone = Arc::clone(&state);
+            let worker_ops = args.worker_ops;
+            thread::spawn(move || {
+                println!("Process spawner {} ready", i);
+                process_spawner(state_clone, i, worker_ops);
+            });
+        }
+    } else {
+        // Default mode: spawn worker threads
+        for i in 0..num_cores {
+            let state_clone = Arc::clone(&state);
+            thread::spawn(move || {
+                println!("Worker thread {} ready", i);
+                cpu_worker(state_clone);
+            });
+        }
     }
 
     // Spawn sampling thread
