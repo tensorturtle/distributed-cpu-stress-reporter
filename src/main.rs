@@ -1,22 +1,26 @@
 use axum::{routing::{get, post}, Router};
 use clap::Parser;
+use rand_distr::{Distribution, Exp};
 use serde::{Deserialize, Serialize};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum ExecutionMode {
     Threaded,
     FreshProcess,
+    Bursty,
 }
 
 #[derive(Debug, Deserialize)]
 struct StartCpuRequest {
     mode: ExecutionMode,
+    /// Optional utilization percentage for bursty mode (0-100, default 50)
+    utilization: Option<f64>,
 }
 
 #[derive(Parser, Debug)]
@@ -38,6 +42,12 @@ struct AppState {
     current_counter: Arc<AtomicU64>,
     is_running: AtomicBool,
     execution_mode: Mutex<ExecutionMode>,
+    // Bursty mode state
+    burst_phase: AtomicBool,
+    burst_total_ops: AtomicU64,
+    burst_total_time_ms: AtomicU64,
+    burst_ops_per_second: AtomicU64,
+    bursty_utilization: Mutex<f64>,
 }
 
 // Simple prime number check using trial division
@@ -159,11 +169,122 @@ fn process_spawner(state: Arc<AppState>, core_id: usize, worker_ops: u64) {
     }
 }
 
+// Burst metrics calculator: Calculates ops/sec based on accumulated burst time
+fn burst_metrics_calculator(state: Arc<AppState>) {
+    loop {
+        thread::sleep(Duration::from_secs(1));
+
+        // Only calculate when in bursty mode
+        if *state.execution_mode.lock().unwrap() == ExecutionMode::Bursty {
+            let total_ops = state.burst_total_ops.load(Ordering::Relaxed);
+            let total_time_ms = state.burst_total_time_ms.load(Ordering::Relaxed);
+
+            if total_time_ms > 0 {
+                // Calculate ops per second: (total_ops * 1000) / total_time_ms
+                let ops_per_sec = (total_ops * 1000) / total_time_ms;
+                state.burst_ops_per_second.store(ops_per_sec, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+// Burst coordinator: Controls burst/idle phases with exponential distribution
+fn burst_coordinator(state: Arc<AppState>, num_cores: usize, worker_ops: u64) {
+    let exe_path = std::env::current_exe().expect("Failed to get current executable path");
+    let mut rng = rand::thread_rng();
+    // Exponential distribution with lambda=0.67 gives mean ~1.5s
+    let exp_dist = Exp::new(0.67).expect("Failed to create exponential distribution");
+
+    loop {
+        // Check if we should be running AND in bursty mode
+        let is_active = state.is_running.load(Ordering::Relaxed)
+            && *state.execution_mode.lock().unwrap() == ExecutionMode::Bursty;
+
+        if !is_active {
+            state.burst_phase.store(false, Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        // Sample burst duration from exponential distribution, clamp to [500ms, 5s]
+        let burst_duration_secs = exp_dist.sample(&mut rng);
+        let burst_duration_secs = f64::clamp(burst_duration_secs, 0.5, 5.0);
+        let burst_duration = Duration::from_secs_f64(burst_duration_secs);
+
+        // Enter burst phase
+        state.burst_phase.store(true, Ordering::Relaxed);
+        let burst_start = Instant::now();
+
+        // Spawn fresh worker processes (one per core)
+        let mut children = Vec::new();
+        for core_id in 0..num_cores {
+            match Command::new(&exe_path)
+                .arg("--worker")
+                .arg("--worker-ops")
+                .arg(worker_ops.to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => children.push((core_id, child)),
+                Err(e) => eprintln!("Failed to spawn burst worker {}: {}", core_id, e),
+            }
+        }
+
+        // Let processes run for the burst duration
+        thread::sleep(burst_duration);
+
+        // Exit burst phase and measure actual elapsed time
+        let burst_elapsed = burst_start.elapsed();
+        state.burst_phase.store(false, Ordering::Relaxed);
+
+        // Collect results from worker processes
+        let mut total_ops_this_burst = 0u64;
+        for (core_id, child) in children {
+            match child.wait_with_output() {
+                Ok(output) if output.status.success() => {
+                    if let Ok(stdout) = String::from_utf8(output.stdout) {
+                        if let Ok(ops) = stdout.trim().parse::<u64>() {
+                            total_ops_this_burst += ops;
+                        }
+                    }
+                }
+                Ok(output) => {
+                    eprintln!("Burst worker {} exited with status: {}", core_id, output.status);
+                }
+                Err(e) => {
+                    eprintln!("Failed to wait for burst worker {}: {}", core_id, e);
+                }
+            }
+        }
+
+        // Accumulate totals for time-aware metrics
+        state.burst_total_ops.fetch_add(total_ops_this_burst, Ordering::Relaxed);
+        state.burst_total_time_ms.fetch_add(burst_elapsed.as_millis() as u64, Ordering::Relaxed);
+
+        // Calculate idle duration to maintain target utilization
+        let utilization = *state.bursty_utilization.lock().unwrap();
+        let idle_duration_secs = burst_duration_secs * (1.0 - utilization) / utilization;
+        let idle_duration = Duration::from_secs_f64(idle_duration_secs);
+
+        // Idle period (no processes running)
+        thread::sleep(idle_duration);
+    }
+}
+
 // HTTP handler for /cpu-perf endpoint
 async fn cpu_perf_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> String {
     let ops = state.operations_per_second.load(Ordering::Relaxed);
+    format!("{}\n", ops)
+}
+
+// HTTP handler for /burst-perf endpoint - returns burst-only performance metrics
+async fn burst_perf_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> String {
+    let ops = state.burst_ops_per_second.load(Ordering::Relaxed);
     format!("{}\n", ops)
 }
 
@@ -176,6 +297,19 @@ async fn start_cpu_handler(
     let requested_mode = request.mode;
     let is_running = state.is_running.load(Ordering::Relaxed);
 
+    // Handle utilization for bursty mode
+    if requested_mode == ExecutionMode::Bursty {
+        let utilization_pct = request.utilization.unwrap_or(50.0);
+
+        // Validate utilization is between 0 and 100
+        if utilization_pct <= 0.0 || utilization_pct > 100.0 {
+            return format!("Error: utilization must be between 0 and 100 (got {})\n", utilization_pct);
+        }
+
+        // Store as fraction (0.0-1.0)
+        *state.bursty_utilization.lock().unwrap() = utilization_pct / 100.0;
+    }
+
     // If already running with a different mode, we need to restart
     if is_running && current_mode != requested_mode {
         println!("Mode change requested while running. Stopping, changing mode, and restarting...");
@@ -186,6 +320,9 @@ async fn start_cpu_handler(
         // Reset counters
         state.current_counter.store(0, Ordering::Relaxed);
         state.operations_per_second.store(0, Ordering::Relaxed);
+        state.burst_total_ops.store(0, Ordering::Relaxed);
+        state.burst_total_time_ms.store(0, Ordering::Relaxed);
+        state.burst_ops_per_second.store(0, Ordering::Relaxed);
 
         // Wait a moment for workers to notice the stop
         thread::sleep(Duration::from_millis(200));
@@ -196,18 +333,35 @@ async fn start_cpu_handler(
         // Start with new mode
         state.is_running.store(true, Ordering::Relaxed);
 
-        println!("CPU stress test RESTARTED with mode: {:?}", requested_mode);
-        format!("CPU stress test restarted with mode: {:?}\n", requested_mode)
+        if requested_mode == ExecutionMode::Bursty {
+            let util_pct = *state.bursty_utilization.lock().unwrap() * 100.0;
+            println!("CPU stress test RESTARTED with mode: {:?}, utilization: {:.0}%", requested_mode, util_pct);
+            format!("CPU stress test restarted with mode: {:?}, utilization: {:.0}%\n", requested_mode, util_pct)
+        } else {
+            println!("CPU stress test RESTARTED with mode: {:?}", requested_mode);
+            format!("CPU stress test restarted with mode: {:?}\n", requested_mode)
+        }
     } else if is_running && current_mode == requested_mode {
         // Already running with the requested mode
-        format!("CPU stress test already running with mode: {:?}\n", current_mode)
+        if requested_mode == ExecutionMode::Bursty {
+            let util_pct = *state.bursty_utilization.lock().unwrap() * 100.0;
+            format!("CPU stress test already running with mode: {:?}, utilization: {:.0}%\n", current_mode, util_pct)
+        } else {
+            format!("CPU stress test already running with mode: {:?}\n", current_mode)
+        }
     } else {
         // Not running, so set mode and start
         *state.execution_mode.lock().unwrap() = requested_mode;
         state.is_running.store(true, Ordering::Relaxed);
 
-        println!("CPU stress test STARTED with mode: {:?}", requested_mode);
-        format!("CPU stress test started with mode: {:?}\n", requested_mode)
+        if requested_mode == ExecutionMode::Bursty {
+            let util_pct = *state.bursty_utilization.lock().unwrap() * 100.0;
+            println!("CPU stress test STARTED with mode: {:?}, utilization: {:.0}%", requested_mode, util_pct);
+            format!("CPU stress test started with mode: {:?}, utilization: {:.0}%\n", requested_mode, util_pct)
+        } else {
+            println!("CPU stress test STARTED with mode: {:?}", requested_mode);
+            format!("CPU stress test started with mode: {:?}\n", requested_mode)
+        }
     }
 }
 
@@ -217,9 +371,12 @@ async fn end_cpu_handler(
 ) -> String {
     // Idempotent stop - always returns success
     state.is_running.store(false, Ordering::Relaxed);
-    // Reset the counter and operations per second when stopping
+    // Reset all counters when stopping
     state.current_counter.store(0, Ordering::Relaxed);
     state.operations_per_second.store(0, Ordering::Relaxed);
+    state.burst_total_ops.store(0, Ordering::Relaxed);
+    state.burst_total_time_ms.store(0, Ordering::Relaxed);
+    state.burst_ops_per_second.store(0, Ordering::Relaxed);
     println!("CPU stress test STOPPED");
     "CPU stress test stopped\n".to_string()
 }
@@ -242,11 +399,16 @@ async fn main() {
     println!();
     println!("Control endpoints:");
     println!("  POST http://localhost:8080/start-cpu - Start CPU stress test (requires JSON body with mode)");
-    println!("       Example: curl -X POST http://localhost:8080/start-cpu -H 'Content-Type: application/json' -d '{{\"mode\":\"threaded\"}}'");
-    println!("       Modes: \"threaded\" or \"fresh-process\"");
+    println!("       Examples:");
+    println!("         curl -X POST http://localhost:8080/start-cpu -H 'Content-Type: application/json' -d '{{\"mode\":\"threaded\"}}'");
+    println!("         curl -X POST http://localhost:8080/start-cpu -H 'Content-Type: application/json' -d '{{\"mode\":\"fresh-process\"}}'");
+    println!("         curl -X POST http://localhost:8080/start-cpu -H 'Content-Type: application/json' -d '{{\"mode\":\"bursty\",\"utilization\":60}}'");
+    println!("       Modes: \"threaded\", \"fresh-process\", or \"bursty\"");
+    println!("       Bursty mode options: \"utilization\" (0-100, default 50) - target CPU utilization percentage");
     println!("  POST http://localhost:8080/end-cpu   - Stop CPU stress test");
-    println!("Query endpoint:");
-    println!("  GET  http://localhost:8080/cpu-perf  - Get operations per second");
+    println!("Query endpoints:");
+    println!("  GET  http://localhost:8080/cpu-perf   - Get operations per second (threaded/fresh-process modes)");
+    println!("  GET  http://localhost:8080/burst-perf - Get burst-only operations per second (bursty mode)");
     println!();
     println!("CPU stress test is currently STOPPED. Send POST to /start-cpu with mode to begin.");
     println!();
@@ -257,6 +419,11 @@ async fn main() {
         current_counter: Arc::new(AtomicU64::new(0)),
         is_running: AtomicBool::new(false),
         execution_mode: Mutex::new(ExecutionMode::FreshProcess),
+        burst_phase: AtomicBool::new(false),
+        burst_total_ops: AtomicU64::new(0),
+        burst_total_time_ms: AtomicU64::new(0),
+        burst_ops_per_second: AtomicU64::new(0),
+        bursty_utilization: Mutex::new(0.5), // Default 50% utilization
     });
 
     // Spawn BOTH types of workers - they'll activate based on the execution_mode
@@ -287,12 +454,30 @@ async fn main() {
         });
     }
 
+    // Spawn burst coordinator thread
+    {
+        let state_clone = Arc::clone(&state);
+        thread::spawn(move || {
+            println!("Burst coordinator ready (inactive until mode=bursty)");
+            burst_coordinator(state_clone, num_cores, args.worker_ops);
+        });
+    }
+
+    // Spawn burst metrics calculator thread
+    {
+        let state_clone = Arc::clone(&state);
+        thread::spawn(move || {
+            burst_metrics_calculator(state_clone);
+        });
+    }
+
     // Wait a moment for threads to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Build HTTP router
     let app = Router::new()
         .route("/cpu-perf", get(cpu_perf_handler))
+        .route("/burst-perf", get(burst_perf_handler))
         .route("/start-cpu", post(start_cpu_handler))
         .route("/end-cpu", post(end_cpu_handler))
         .with_state(state);

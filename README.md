@@ -73,16 +73,18 @@ done
 
 ## How It Works
 
-- Spawns both threaded and fresh-process workers (one per CPU core)
+- Spawns threaded workers, fresh-process spawners, and burst coordinator (one per CPU core)
 - CPU stress test starts in STOPPED state (use `/start-cpu` to begin)
 - Mode selection determines which worker type is active:
   - **Threaded mode**: Long-running threads continuously calculate primes (max performance)
   - **Fresh-process mode**: Spawns short-lived child processes for each calculation cycle (avoids scheduler bias)
-- Atomic counter tracks operations per second (1-second intervals)
+  - **Bursty mode**: Spawns processes during bursts with exponential distribution timing (realistic workload patterns)
+- Atomic counters track operations per second with time-aware metrics for bursty mode
 - HTTP server (Axum) provides control and query endpoints:
-  - POST `/start-cpu` - Start CPU stress test (requires JSON body with mode)
+  - POST `/start-cpu` - Start CPU stress test (requires JSON body with mode and optional utilization)
   - POST `/end-cpu` - Stop CPU stress test
-  - GET `/cpu-perf` - Get current operations per second
+  - GET `/cpu-perf` - Get current operations per second (threaded/fresh-process modes)
+  - GET `/burst-perf` - Get burst-only operations per second (bursty mode)
 
 **Why prime numbers?** Pure CPU computation with no I/O - perfect for measuring CPU performance.
 
@@ -108,7 +110,7 @@ When measuring CPU overprovisioning effects, catch-up bias can skew results. If 
 
 ### Execution Modes
 
-The application supports two execution modes, controlled via the HTTP API:
+The application supports three execution modes, controlled via the HTTP API:
 
 #### Fresh Process Mode (Default & Recommended)
 
@@ -147,6 +149,48 @@ In this mode:
 - Single instance testing
 - All instances launched simultaneously
 
+#### Bursty Mode
+
+```bash
+curl -X POST http://localhost:8080/start-cpu \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"bursty","utilization":60}'
+```
+
+In this mode:
+- Simulates consumer desktop CPU usage patterns with realistic bursty behavior
+- Alternates between CPU bursts and idle periods using exponential distribution
+- Burst durations: 500ms-5s (exponentially distributed, mean ~1.5s)
+- Configurable utilization percentage (0-100, default 50)
+- Uses fresh processes during bursts (avoids scheduler bias)
+- Time-aware metrics track performance only during burst periods
+- Independent random timing per VM instance (desynchronized across hosts)
+
+**Query burst performance:**
+```bash
+curl http://localhost:8080/burst-perf
+# Returns: 233672 (ops/sec during bursts only)
+```
+
+**When to use:**
+- Testing CPU contention with realistic workload patterns
+- Simulating consumer desktop or mixed workload scenarios
+- Measuring "how much CPU do we get when we need it?"
+- Testing multiple VMs with desynchronized load patterns
+
+**Example: Different utilization levels**
+```bash
+# Light bursty load (25% utilization)
+curl -X POST http://localhost:8080/start-cpu \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"bursty","utilization":25}'
+
+# Heavy bursty load (75% utilization)
+curl -X POST http://localhost:8080/start-cpu \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"bursty","utilization":75}'
+```
+
 #### Switching Modes
 
 You can switch modes at any time via the API. If the CPU stress test is running, it will automatically restart with the new mode:
@@ -156,6 +200,11 @@ You can switch modes at any time via the API. If the CPU stress test is running,
 curl -X POST http://localhost:8080/start-cpu \
   -H 'Content-Type: application/json' \
   -d '{"mode":"threaded"}'
+
+# Switch to bursty mode
+curl -X POST http://localhost:8080/start-cpu \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"bursty","utilization":50}'
 ```
 
 ## Installation
@@ -187,7 +236,10 @@ A: No. Standard CPU stress test like Prime95.
 A: `curl -X POST http://localhost:8080/end-cpu` or `Ctrl+C` to exit the application
 
 **Q: Which mode should I use?**
-A: Use fresh-process mode (the default) for most testing scenarios, especially when comparing multiple instances. Use threaded mode only when you need maximum performance or are testing a single instance.
+A:
+- **Fresh-process mode** (default): Most testing scenarios, especially when comparing multiple instances
+- **Threaded mode**: Maximum performance or single instance testing
+- **Bursty mode**: Realistic workload patterns, testing CPU responsiveness during bursts, simulating desktop/mixed workloads
 
 **Q: Can I change the port?**
 A: Edit `src/main.rs:110` and rebuild.
