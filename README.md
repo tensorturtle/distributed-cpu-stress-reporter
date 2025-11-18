@@ -160,7 +160,7 @@ curl -X POST http://localhost:8080/start-cpu \
 In this mode:
 - Simulates consumer desktop CPU usage patterns with realistic bursty behavior
 - Alternates between CPU bursts and idle periods using exponential distribution
-- Burst durations: 500ms-5s (exponentially distributed, mean ~1.5s)
+- Burst durations: 50ms-1s (exponentially distributed, mean ~300ms)
 - Configurable utilization percentage (0-100, default 50)
 - Uses fresh processes during bursts (avoids scheduler bias)
 - Time-aware metrics track performance only during burst periods

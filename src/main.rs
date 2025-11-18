@@ -186,8 +186,8 @@ fn burst_coordinator(state: Arc<AppState>, core_id: usize, worker_ops: u64) {
     let exe_path = std::env::current_exe().expect("Failed to get current executable path");
     let mut rng = thread_rng(); // Independent RNG per thread
 
-    // Exponential distribution for burst duration: λ = 1/mean = 1/1.5 ≈ 0.667
-    let burst_exp = Exp::new(0.667).expect("Failed to create exponential distribution");
+    // Exponential distribution for burst duration: λ = 1/mean = 1/0.3 ≈ 3.33
+    let burst_exp = Exp::new(3.33).expect("Failed to create exponential distribution");
 
     loop {
         // Check if we should be running AND in bursty mode
@@ -199,9 +199,9 @@ fn burst_coordinator(state: Arc<AppState>, core_id: usize, worker_ops: u64) {
             continue;
         }
 
-        // Sample burst duration: exponentially distributed, clamped to [500ms, 5s]
+        // Sample burst duration: exponentially distributed, clamped to [50ms, 1s]
         let sampled: f64 = burst_exp.sample(&mut rng);
-        let burst_duration_s = sampled.clamp(0.5, 5.0);
+        let burst_duration_s = sampled.clamp(0.05, 1.0);
         let burst_duration_ms = (burst_duration_s * 1000.0) as u64;
 
         // Get current utilization percentage
